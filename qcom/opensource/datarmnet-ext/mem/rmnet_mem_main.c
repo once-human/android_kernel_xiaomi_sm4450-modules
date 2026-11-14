@@ -20,11 +20,7 @@ unsigned int rmnet_mem_debug __read_mostly;
 module_param(rmnet_mem_debug, uint, 0644);
 MODULE_PARM_DESC(rmnet_mem_debug, "rmnet_mem debug status");
 
-#ifdef RMNET_LOWMEM_TARGET
 unsigned int rmnet_mem_pool_check_boundary __read_mostly = 40;
-#else
-unsigned int rmnet_mem_pool_check_boundary __read_mostly = 5;
-#endif
 module_param(rmnet_mem_pool_check_boundary, uint, 0644);
 MODULE_PARM_DESC(rmnet_mem_pool_check_boundary, "rmnet_mem pool check boundary");
 
@@ -84,8 +80,20 @@ static char *verinfo[] = {"2003bae3"};
 module_param_array(verinfo, charp, NULL, 0444);
 MODULE_PARM_DESC(verinfo, "Version of the driver");
 
+/*
+ * Pool pages are a cache: every caller copes with a NULL page. Never let them
+ * dip into the emergency reserves or wake reclaim from softirq, and fill the
+ * pool from process context instead.
+ */
+#define RMNET_MEM_GFP_OPPORTUNISTIC (__GFP_NOWARN | __GFP_NORETRY | \
+				     __GFP_NOMEMALLOC | __GFP_COMP)
+#define RMNET_MEM_REFILL_GFP (GFP_KERNEL | RMNET_MEM_GFP_OPPORTUNISTIC)
+#define RMNET_MEM_REFILL_INTERVAL HZ
+
 struct workqueue_struct *mem_wq;
 struct delayed_work pool_adjust_work;
+static struct delayed_work pool_refill_work;
+static unsigned long pool_refill_last;
 int pb_ind_pending;
 struct  hrtimer pb_timer;
 
@@ -160,17 +168,86 @@ int rmnet_mem_unregister_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(rmnet_mem_unregister_notifier);
 
+static struct mem_info *rmnet_mem_insert_slot(struct mem_info *mem_slot,
+					      struct page *page, u8 pageorder);
+
 /* Malloc by client so rem from to pool */
 struct mem_info* rmnet_mem_add_page(struct page *page, u8 pageorder)
 {
 	struct mem_info *mem_slot;
 
-	mem_slot = kzalloc(sizeof(*mem_slot), GFP_ATOMIC);
+	mem_slot = kzalloc(sizeof(*mem_slot), GFP_ATOMIC | __GFP_NOWARN);
 	if (!mem_slot) {
 		rmnet_mem_err[ERR_MALLOC_FAIL1]++;
 		return NULL;
 	}
 
+	return rmnet_mem_insert_slot(mem_slot, page, pageorder);
+}
+
+static struct page *rmnet_mem_alloc_atomic(gfp_t gfp_mask, unsigned int order)
+{
+	gfp_t gfp = gfp_mask | RMNET_MEM_GFP_OPPORTUNISTIC;
+
+	if (order)
+		gfp &= ~__GFP_RECLAIM;
+
+	return alloc_pages(gfp, order);
+}
+
+static bool rmnet_mem_refill_one(u8 pageorder)
+{
+	struct mem_info *mem_slot;
+	struct page *page;
+	unsigned long flags;
+
+	page = alloc_pages(RMNET_MEM_REFILL_GFP, pageorder);
+	if (!page)
+		return false;
+
+	mem_slot = kzalloc(sizeof(*mem_slot), GFP_KERNEL | __GFP_NOWARN);
+	if (!mem_slot) {
+		__free_pages(page, pageorder);
+		rmnet_mem_err[ERR_MALLOC_FAIL1]++;
+		return false;
+	}
+
+	spin_lock_irqsave(&rmnet_mem_lock, flags);
+	rmnet_mem_insert_slot(mem_slot, page, pageorder);
+	spin_unlock_irqrestore(&rmnet_mem_lock, flags);
+	cond_resched();
+
+	return true;
+}
+
+static void mem_refill_pool_work(struct work_struct *work)
+{
+	int i, want;
+
+	for (i = 0; i < POOL_LEN; i++) {
+		want = min_t(int, target_pool_size[i], max_pool_size[i]);
+		while (READ_ONCE(static_pool_size[i]) < want) {
+			if (!rmnet_mem_refill_one(i))
+				break;
+		}
+	}
+}
+
+static void rmnet_mem_kick_refill(void)
+{
+	unsigned long now = jiffies;
+
+	if (!mem_wq ||
+	    time_before(now, READ_ONCE(pool_refill_last) + RMNET_MEM_REFILL_INTERVAL))
+		return;
+
+	WRITE_ONCE(pool_refill_last, now);
+	queue_delayed_work(mem_wq, &pool_refill_work, 0);
+}
+
+static struct mem_info *rmnet_mem_insert_slot(struct mem_info *mem_slot,
+					      struct page *page, u8 pageorder)
+{
 	static_pool_size[pageorder]++;
 
 	mem_slot->order = pageorder;
@@ -290,13 +367,11 @@ struct page* rmnet_mem_get_pages_entry(gfp_t gfp_mask, unsigned int order, int *
 		 * will fail too so that is akin to retry. So just hardcode to not retry for o3 page req
 		 */
 		if (order < 3) {
-			page = __dev_alloc_pages((adding)? GFP_ATOMIC : gfp_mask, order);
+			page = rmnet_mem_alloc_atomic((adding)? GFP_ATOMIC : gfp_mask, order);
 			if (page) {
 				/* If below unbound limit then add page to static pool*/
-				if (adding) {
-					rmnet_mem_add_page(page, order);
+				if (adding && rmnet_mem_add_page(page, order))
 					page_ref_inc(page);
-				}
 
 				if (pageorder) {
 					*pageorder = order;
@@ -305,12 +380,9 @@ struct page* rmnet_mem_get_pages_entry(gfp_t gfp_mask, unsigned int order, int *
 		} else {
 			/* Only call get page if we will add page to static pool*/
 			if (adding) {
-				page = __dev_alloc_pages((adding)? GFP_ATOMIC : gfp_mask, order);
-				if (page) {
-
-					rmnet_mem_add_page(page, order);
+				page = rmnet_mem_alloc_atomic(GFP_ATOMIC, order);
+				if (page && rmnet_mem_add_page(page, order))
 					page_ref_inc(page);
-				}
 
 				if (pageorder) {
 					*pageorder = order;
@@ -321,6 +393,9 @@ struct page* rmnet_mem_get_pages_entry(gfp_t gfp_mask, unsigned int order, int *
 	/* If we had potential to add, this won't occur after we fill up to limit */
 	if (adding)
 		spin_unlock_irqrestore(&rmnet_mem_lock, flags);
+
+	if (!page && order >= 2)
+		rmnet_mem_kick_refill();
 
 	if (pageorder && code && page) {
 		if (*pageorder == order)
@@ -350,7 +425,6 @@ static void mem_update_pool_work(struct work_struct *work)
 	int i;
 	int new_size;
 
-	local_bh_disable();
 	for (i = 0; i < POOL_LEN; i++) {
 	/* If PB ind is active and max pool has been configured
 	 * new pool size is max of the two.
@@ -361,7 +435,6 @@ static void mem_update_pool_work(struct work_struct *work)
 
 		rmnet_mem_adjust(new_size, i);
 	}
-	local_bh_enable();
 
 }
 
@@ -371,7 +444,6 @@ void rmnet_mem_adjust(unsigned perm_size, u8 pageorder)
 	struct list_head *entry, *next;
 	struct mem_info *mem_slot;
 	int i;
-	struct page  *newpage = NULL;
 	int adjustment;
 	unsigned long flags;
 
@@ -385,17 +457,13 @@ void rmnet_mem_adjust(unsigned perm_size, u8 pageorder)
 	if (perm_size == static_pool_size[pageorder])
 		return;
 
-	spin_lock_irqsave(&rmnet_mem_lock, flags);
-
 	if (perm_size > static_pool_size[pageorder]) {
-		for (i = 0; i < (adjustment); i++) {
-			newpage = __dev_alloc_pages(GFP_ATOMIC, pageorder);
-			if (!newpage) {
-				continue;
-			}
-			rmnet_mem_add_page(newpage, pageorder);
+		for (i = 0; i < adjustment; i++) {
+			if (!rmnet_mem_refill_one(pageorder))
+				break;
 		}
 	} else {
+		spin_lock_irqsave(&rmnet_mem_lock, flags);
 	/*TODO what if shrink comes in when we have allocated all pages, can't shrink currently */
 	/* Shrink static pool */
 		list_for_each_safe(entry, next, &(rmnet_mem_pool[pageorder])) {
@@ -409,8 +477,8 @@ void rmnet_mem_adjust(unsigned perm_size, u8 pageorder)
 			if (static_pool_size[pageorder] == perm_size)
 				break;
 		}
+		spin_unlock_irqrestore(&rmnet_mem_lock, flags);
 	}
-	spin_unlock_irqrestore(&rmnet_mem_lock, flags);
 	if (pageorder == POOL_NOTIF) {
 		rmnet_mem_mode_notify(perm_size);
 	}
@@ -467,6 +535,7 @@ int __init rmnet_mem_module_init(void)
 	}
 
 	INIT_DELAYED_WORK(&pool_adjust_work, mem_update_pool_work);
+	INIT_DELAYED_WORK(&pool_refill_work, mem_refill_pool_work);
 
 	rc = rmnet_mem_nl_register();
 	if (rc) {
@@ -479,6 +548,9 @@ int __init rmnet_mem_module_init(void)
 	hrtimer_init(&pb_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	pb_timer.function = rmnet_mem_pb_timer_cb;
 
+	pool_refill_last = jiffies - RMNET_MEM_REFILL_INTERVAL;
+	queue_delayed_work(mem_wq, &pool_refill_work, 0);
+
 	return 0;
 }
 
@@ -488,6 +560,7 @@ void __exit rmnet_mem_module_exit(void)
 
 	if (mem_wq) {
 		cancel_delayed_work_sync(&pool_adjust_work);
+		cancel_delayed_work_sync(&pool_refill_work);
 		drain_workqueue(mem_wq);
 		destroy_workqueue(mem_wq);
 		mem_wq = NULL;
