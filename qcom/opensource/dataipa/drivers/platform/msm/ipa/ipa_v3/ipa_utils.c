@@ -12483,12 +12483,24 @@ void ipa3_force_close_coal(
 	}
 
 	if ( num_desc ) {
+		bool tag_before_gating = ipa3_ctx->tag_process_before_gating;
+
 		IPADBG("Sending %d descriptor(s) for coal force close\n", num_desc);
 		if ( ipa3_send_cmd_timeout(
 				 num_desc,
 				 desc,
 				 IPA_COAL_CLOSE_FRAME_CMD_TIMEOUT_MSEC) ) {
 			IPADBG("ipa3_send_cmd_timeout timedout\n");
+		} else {
+			/*
+			 * The command has completed, so it needs no TAG before
+			 * the clocks gate. Sending one anyway made a loop: the
+			 * TAG status lands on APPS_LAN_CONS, which votes the
+			 * clocks on, and the next gating closed the frames and
+			 * sent another TAG, about 8 times a second with no
+			 * traffic. That kept the phone from suspending.
+			 */
+			ipa3_ctx->tag_process_before_gating = tag_before_gating;
 		}
 	}
 }
