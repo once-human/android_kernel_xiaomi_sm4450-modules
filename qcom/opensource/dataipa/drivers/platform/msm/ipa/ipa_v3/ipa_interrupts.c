@@ -421,6 +421,24 @@ irq_handler_t ipa3_get_isr(void)
 	return ipa3_isr;
 }
 
+/*
+ * The IPA interrupt is level triggered (IRQ_TYPE_LEVEL_HIGH in the device
+ * tree). Requested as a rising edge, an interrupt that came in while the
+ * clocks were off was only queued for later, and any source still pending
+ * when the handler finished left the line high with no new edge: on 6.18
+ * the IPA interrupt stopped after a few dozen, the TX_SUSPEND bits stayed
+ * set, the pipes never suspended and the IPA clocks never gated, so CX
+ * never collapsed. As a oneshot threaded handler the line stays masked
+ * until the handler has clocked IPA on and cleared every source.
+ */
+static irqreturn_t ipa3_isr_thread(int irq, void *ctxt)
+{
+	IPA_ACTIVE_CLIENTS_INC_SIMPLE();
+	ipa3_process_interrupts(true);
+	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
+	return IRQ_HANDLED;
+}
+
 /**
  * ipa_add_interrupt_handler() - Adds handler to an interrupt type
  * @interrupt:		Interrupt type
@@ -627,8 +645,8 @@ int ipa3_interrupts_init(u32 ipa_irq, u32 ee, struct device *ipa_dev)
 	 *  emulator interrupts are handled...
 	 */
 	if (ipa3_ctx->ipa3_hw_mode != IPA_HW_MODE_EMULATION) {
-		res = request_irq(ipa_irq, (irq_handler_t) ipa3_isr,
-					IRQF_TRIGGER_RISING, "ipa", ipa_dev);
+		res = request_threaded_irq(ipa_irq, NULL, ipa3_isr_thread,
+					IRQF_ONESHOT, "ipa", ipa_dev);
 		if (res) {
 			IPAERR(
 			    "fail to register IPA IRQ handler irq=%d\n",
